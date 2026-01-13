@@ -37,3 +37,6 @@ jobs:
 
       - name: Run FG Stock Script
         run: python fg_stock.py
+
+      - name: Run FG Pack Script
+        run: python fg_pack.py
