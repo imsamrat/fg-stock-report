@@ -40,3 +40,11 @@ jobs:
 
       - name: Run FG Pack Script
         run: python fg_pack.py
+
+      - name: Send Telegram Notification
+        if: success()
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+          -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+          -d text="✅ *Daily FG Stock Report Success*%0AFG Stock reports ran successfully on GitHub Actions." \
+          -d parse_mode="Markdown"
