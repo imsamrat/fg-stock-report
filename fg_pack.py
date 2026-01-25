@@ -44,6 +44,8 @@ order_fields = [
     "company_id",
     "qty",
     "final_price",
+    "fg_categ_type",
+    "sale_order_line",
 ]
 
 records = models.execute_kw(
@@ -104,6 +106,8 @@ for rec in records:
             "action_date": format_date(rec.get("action_date")),
             "oa": safe_field(rec.get("oa_id")),
             "company": safe_field(rec.get("company_id")),
+            "item": safe_field(rec.get("fg_categ_type")),
+            "id": rec.get("sale_order_line")[0] if isinstance(rec.get("sale_order_line"), list) else (rec.get("sale_order_line") or ""),
             "qty": rec.get("qty") or 0.0,
             "pack_value": (rec.get("final_price") or 0.0) * (rec.get("qty") or 0.0),
         }
@@ -123,13 +127,15 @@ if not df.empty:
     # Fill NaN values for grouping columns to avoid data loss
     df["oa"] = df["oa"].fillna("")
     df["company"] = df["company"].fillna("")
+    df["item"] = df["item"].fillna("")
+    df["id"] = df["id"].fillna("")
 
     # Truncate action_date to just the date (YYYY-MM-DD) to merge same-day records
     df["action_date"] = df["action_date"].dt.date
     
     # Group by action_date, oa, company and sum qty, pack_value
     # Using as_index=False to keep the grouping columns
-    df = df.groupby(["action_date", "oa", "company"], as_index=False)[["qty", "pack_value"]].sum()
+    df = df.groupby(["action_date", "oa", "company", "item", "id"], as_index=False)[["qty", "pack_value"]].sum()
 
     # Sort by action_date ASC, then oa ASC
     df = df.sort_values(by=["action_date", "oa"], ascending=[True, True])
@@ -217,7 +223,7 @@ try:
     last_col_letter = col_to_letter(num_cols - 1)
     
     # Target row from user request
-    START_ROW = 33557
+    START_ROW = 128621
     target_range = f"A{START_ROW}:{last_col_letter}{START_ROW + num_rows}"
     
     print(f"Updating range {target_range} (Appended data)...")
