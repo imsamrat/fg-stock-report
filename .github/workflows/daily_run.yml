@@ -3,8 +3,8 @@ name: Daily FG Stock Report
 on:
   schedule:
     # 5:00 AM Dhaka Time = 23:00 UTC (previous day)
-    - cron: '0 23 * * *'
-  workflow_dispatch:  # Allow manual trigger
+    - cron: "0 23 * * *"
+  workflow_dispatch: # Allow manual trigger
 
 jobs:
   run-script:
@@ -17,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: "3.9"
 
       - name: Install dependencies
         run: |
