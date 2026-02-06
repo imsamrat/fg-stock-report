@@ -1,4 +1,5 @@
 import os
+import time
 import xmlrpc.client
 import pandas as pd
 from datetime import datetime, timedelta
@@ -25,6 +26,25 @@ if not uid:
     raise Exception("❌ Failed to authenticate with Odoo. Check credentials.")
 
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+def execute_kw_with_retry(model_proxy, db, uid, password, model_name, method, args, kwargs=None, retries=5, delay=5):
+    """
+    Executes an Odoo XML-RPC call with retry logic for ProtocolErrors (e.g., 502 Bad Gateway).
+    """
+    if kwargs is None:
+        kwargs = {}
+    
+    for attempt in range(retries):
+        try:
+            return model_proxy.execute_kw(db, uid, password, model_name, method, args, kwargs)
+        except xmlrpc.client.ProtocolError as e:
+            print(f"⚠️ XML-RPC ProtocolError: {e}. Retrying in {delay} seconds... (Attempt {attempt + 1}/{retries})")
+            time.sleep(delay)
+        except Exception as e:
+            # Re-raise other exceptions immediately
+            raise e
+            
+    raise Exception(f"❌ Failed to execute {method} on {model_name} after {retries} retries.")
 
 # ---------------- FILTER AND FIELDS ----------------
 order_domain = [
@@ -61,7 +81,8 @@ order_fields = [
     # "date_order",
 ]
 
-records = models.execute_kw(
+records = execute_kw_with_retry(
+    models,
     ODOO_DB,
     uid,
     ODOO_API_KEY or ODOO_PASSWORD,
@@ -111,7 +132,8 @@ partner_ids = list({rec["partner_id"][0] for rec in records if rec.get("partner_
 partners = []
 partner_map = {}
 if partner_ids:
-    partners = models.execute_kw(
+    partners = execute_kw_with_retry(
+        models,
         ODOO_DB,
         uid,
         ODOO_API_KEY or ODOO_PASSWORD,
@@ -134,9 +156,13 @@ try:
         print(f"🔍 Fetching {len(inv_line_ids)} invoice lines...")
         # 2. Fetch combine.invoice.line to get invoice_id
         # We need to read 'invoice_id' from 'combine.invoice.line'
-        combine_lines = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY or ODOO_PASSWORD,
-            "combine.invoice.line", "read",
+        combine_lines = execute_kw_with_retry(
+            models,
+            ODOO_DB,
+            uid,
+            ODOO_API_KEY or ODOO_PASSWORD,
+            "combine.invoice.line",
+            "read",
             [inv_line_ids],
             {"fields": ["invoice_id"]}
         )
