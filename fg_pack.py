@@ -14,7 +14,7 @@ ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY")
 
 # ---------------- DYNAMIC DATE FILTER ----------------
-FROM_DATE = "2026-03-01 00:00:00"
+FROM_DATE = "2026-04-01 00:00:00"
 # FROM_DATE = datetime.now().replace(day=1).strftime("%Y-%m-%d 00:00:00")
 # TO_DATE = "2025-12-31 23:59:59"
 TO_DATE = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -227,7 +227,7 @@ try:
     last_col_letter = col_to_letter(num_cols - 1)
 
     # Target row from user request
-    START_ROW = 148645
+    START_ROW = 160541
     target_range = f"A{START_ROW}:{last_col_letter}{START_ROW + num_rows}"
 
     print(f"Updating range {target_range} (Appended data)...")
