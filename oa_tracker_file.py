@@ -31,6 +31,18 @@ FROM_DATE = "2026-01-01 00:00:00"
 # TO_DATE = "2025-12-31 23:59:59"
 TO_DATE = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# Small tolerance to handle rounding differences between OA subtotal and delivered value.
+DELIVERED_VALUE_TOLERANCE = 1.0
+
+# These line items are not physically delivered via Delivery operations, so they should
+# not be counted when determining OA delivery/production status.
+# Add/remove keywords to match your product naming.
+NON_DELIVERABLE_ITEM_KEYWORDS = [
+    "MOULD",
+    "DOCUMENTATION CHARGE",
+    "OTHERS CHARGE",
+]
+
 # ---------------- ODOO CONNECTION ----------------
 common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
 uid = common.authenticate(db, username, api_key or password, {})
@@ -175,6 +187,13 @@ def _format_number(value):
     if value_float.is_integer():
         return str(int(value_float))
     return str(round(value_float, 3))
+
+
+def _is_non_deliverable_item(item_name: str) -> bool:
+    if not item_name:
+        return False
+    upper = str(item_name).upper()
+    return any(keyword in upper for keyword in NON_DELIVERABLE_ITEM_KEYWORDS)
 
 
 def _parse_local_date(date_value):
@@ -566,23 +585,47 @@ for order in orders:
 
     total_oa_qty = sum(oa_qty_list) if oa_qty_list else 0
 
+    deliverable_item_names = [
+        name for name in item_names if not _is_non_deliverable_item(name)
+    ]
+    deliverable_oa_qty_list = [item_agg[name]["qty"] for name in deliverable_item_names]
+    deliverable_oa_value_list = [
+        item_agg[name]["value"] for name in deliverable_item_names
+    ]
+
+    total_oa_qty_deliverable = (
+        sum(deliverable_oa_qty_list) if deliverable_oa_qty_list else 0
+    )
+    total_oa_value_deliverable = (
+        sum(_to_float(v, 0.0) for v in deliverable_oa_value_list)
+        if deliverable_oa_value_list
+        else 0.0
+    )
+
     packed_dates, packed_qtys, total_packed_qty = _date_qty_strings(
         packing_by_oa.get(order_id, {})
     )
     delivery_dates, delivery_qtys, total_delivery_qty = _date_qty_strings(
         delivery_qty_by_oa.get(order_id, {})
     )
-    _, delivery_values, _ = _date_qty_strings(delivery_value_by_oa.get(order_id, {}))
+    _, delivery_values, total_delivery_value = _date_qty_strings(
+        delivery_value_by_oa.get(order_id, {})
+    )
 
     status = ""
     if total_oa_qty:
-        if total_delivery_qty >= total_oa_qty - 3:
+        if total_oa_qty_deliverable == 0:
             status = "Delivered"
-        elif total_delivery_qty > 0 and total_delivery_qty < total_oa_qty:
+        elif (
+            total_delivery_value + DELIVERED_VALUE_TOLERANCE
+            >= total_oa_value_deliverable
+        ):
+            status = "Delivered"
+        elif total_delivery_qty > 0 and total_delivery_qty < total_oa_qty_deliverable:
             status = "Partially delivered"
-        elif total_packed_qty >= total_oa_qty and total_delivery_qty == 0:
+        elif total_packed_qty >= total_oa_qty_deliverable and total_delivery_qty == 0:
             status = "FG Stock"
-        elif total_packed_qty > 0 and total_packed_qty < total_oa_qty:
+        elif total_packed_qty > 0 and total_packed_qty < total_oa_qty_deliverable:
             status = "Partially Production completed"
         elif total_packed_qty == 0:
             status = "Pending Production"
