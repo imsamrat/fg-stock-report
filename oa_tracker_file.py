@@ -557,7 +557,7 @@ for order in orders:
 
     status = ""
     if total_oa_qty:
-        if total_delivery_qty >= total_oa_qty - 1:
+        if total_delivery_qty >= total_oa_qty - 3:
             status = "Delivered"
         elif total_delivery_qty > 0 and total_delivery_qty < total_oa_qty:
             status = "Partially delivered"
