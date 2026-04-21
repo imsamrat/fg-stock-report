@@ -453,6 +453,15 @@ def _extract_m2o_id(value):
     return None
 
 
+def _to_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 def _date_qty_strings(date_qty_map):
     if not date_qty_map:
         return "", "", 0
@@ -482,7 +491,8 @@ for pack in packing_records:
         packing_by_oa[order_id].get(action_date, 0) + qty
     )
 
-delivery_by_oa = {}
+delivery_qty_by_oa = {}
+delivery_value_by_oa = {}
 for delivery in delivery_records:
     order_id = _extract_m2o_id(delivery.get("oa_id"))
     if not order_id:
@@ -490,10 +500,18 @@ for delivery in delivery_records:
     action_date = _parse_local_date(delivery.get("action_date"))
     if not action_date:
         continue
-    qty = delivery.get("qty") or 0
-    delivery_by_oa.setdefault(order_id, {})
-    delivery_by_oa[order_id][action_date] = (
-        delivery_by_oa[order_id].get(action_date, 0) + qty
+    qty = _to_float(delivery.get("qty"), 0.0)
+    final_price = _to_float(delivery.get("final_price"), 0.0)
+    value = qty * final_price
+
+    delivery_qty_by_oa.setdefault(order_id, {})
+    delivery_qty_by_oa[order_id][action_date] = (
+        delivery_qty_by_oa[order_id].get(action_date, 0) + qty
+    )
+
+    delivery_value_by_oa.setdefault(order_id, {})
+    delivery_value_by_oa[order_id][action_date] = (
+        delivery_value_by_oa[order_id].get(action_date, 0) + value
     )
 
 
@@ -552,8 +570,9 @@ for order in orders:
         packing_by_oa.get(order_id, {})
     )
     delivery_dates, delivery_qtys, total_delivery_qty = _date_qty_strings(
-        delivery_by_oa.get(order_id, {})
+        delivery_qty_by_oa.get(order_id, {})
     )
+    _, delivery_values, _ = _date_qty_strings(delivery_value_by_oa.get(order_id, {}))
 
     status = ""
     if total_oa_qty:
@@ -584,6 +603,7 @@ for order in orders:
             "packed_qty": packed_qtys,
             "packed_date": packed_dates,
             "delivery_qty": delivery_qtys,
+            "delivery_value": delivery_values,
             "delivery_date": delivery_dates,
             "status": status,
         }
@@ -608,6 +628,7 @@ column_order = [
     "packed_qty",
     "packed_date",
     "delivery_qty",
+    "delivery_value",
     "delivery_date",
     "status",
 ]
