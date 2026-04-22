@@ -108,7 +108,9 @@ order_fields_base = [
     "order_line",
 ]
 
-order_optional_fields = get_existing_fields("sale.order", ["brand"])
+order_optional_fields = get_existing_fields(
+    "sale.order", ["brand", "marketing_person", "marketing_team"]
+)
 order_fields = order_fields_base + order_optional_fields
 
 orders = models.execute_kw(
@@ -553,6 +555,8 @@ for order in orders:
     company = safe_name(order.get("company_id"))
     salesperson = safe_name(order.get("user_id"))
     team = safe_name(order.get("team_id"))
+    marketing_person = safe_name(order.get("marketing_person"))
+    marketing_team = safe_name(order.get("marketing_team"))
 
     item_agg = {}
     for line_id in order.get("order_line") or []:
@@ -643,6 +647,8 @@ for order in orders:
             "company": company,
             "salesperson": salesperson,
             "team": team,
+            "marketing_person": marketing_person,
+            "marketing_team": marketing_team,
             "item": item_str,
             "oa_qty": oa_qty_str,
             "oa_value": oa_value_str,
@@ -668,6 +674,8 @@ column_order = [
     "company",
     "salesperson",
     "team",
+    "marketing_person",
+    "marketing_team",
     "item",
     "oa_qty",
     "oa_value",
