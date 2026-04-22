@@ -621,10 +621,13 @@ for order in orders:
             >= total_oa_value_deliverable
         ):
             status = "Delivered"
+        elif (
+            total_packed_qty >= total_oa_qty_deliverable
+            and (total_packed_qty - total_delivery_qty) > 0
+        ):
+            status = "FG Stock"
         elif total_delivery_qty > 0 and total_delivery_qty < total_oa_qty_deliverable:
             status = "Partially delivered"
-        elif total_packed_qty >= total_oa_qty_deliverable and total_delivery_qty == 0:
-            status = "FG Stock"
         elif total_packed_qty > 0 and total_packed_qty < total_oa_qty_deliverable:
             status = "Partially Production completed"
         elif total_packed_qty == 0:
