@@ -263,6 +263,8 @@ all_line_ids = [
     line_id for order in orders for line_id in (order.get("order_line") or [])
 ]
 
+line_optional_fields = get_existing_fields("sale.order.line", ["qty_invoiced"])
+
 
 def fetch_order_lines_batched(line_ids, batch_size=1000):
     """Fetch order lines in batches to avoid 502 errors"""
@@ -288,6 +290,7 @@ def fetch_order_lines_batched(line_ids, batch_size=1000):
                         "product_uom_qty",
                         "price_subtotal",
                     ]
+                    + line_optional_fields,
                 },
             )
             all_lines.extend(batch_lines)
@@ -559,10 +562,13 @@ for order in orders:
     marketing_team = safe_name(order.get("marketing_team"))
 
     item_agg = {}
+    total_invoiced_qty = 0.0
     for line_id in order.get("order_line") or []:
         line = line_map.get(line_id)
         if not line:
             continue
+
+        total_invoiced_qty += _to_float(line.get("qty_invoiced"), 0.0)
 
         pt_id = _extract_m2o_id(line.get("product_template_id"))
         item_name = product_fg_map.get(pt_id, "") if pt_id else ""
@@ -588,6 +594,15 @@ for order in orders:
     oa_value_str = ",".join(_format_number(x) for x in oa_value_list)
 
     total_oa_qty = sum(oa_qty_list) if oa_qty_list else 0
+
+    lc_status = ""
+    if total_oa_qty:
+        if total_invoiced_qty >= total_oa_qty:
+            lc_status = "lcr"
+        elif total_invoiced_qty == 0:
+            lc_status = "lcp"
+        else:
+            lc_status = "lcrp"
 
     deliverable_item_names = [
         name for name in item_names if not _is_non_deliverable_item(name)
@@ -658,6 +673,7 @@ for order in orders:
             "delivery_value": delivery_values,
             "delivery_date": delivery_dates,
             "status": status,
+            "lc_status": lc_status,
         }
     )
 
@@ -685,6 +701,7 @@ column_order = [
     "delivery_value",
     "delivery_date",
     "status",
+    "lc_status",
 ]
 
 if df.empty:
