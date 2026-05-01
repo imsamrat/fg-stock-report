@@ -191,6 +191,16 @@ def _format_number(value):
     return str(round(value_float, 3))
 
 
+def _format_3dp(value):
+    if value is None or value == "":
+        return ""
+    try:
+        value_float = float(value)
+    except Exception:
+        return str(value)
+    return f"{value_float:.3f}"
+
+
 def _is_non_deliverable_item(item_name: str) -> bool:
     if not item_name:
         return False
@@ -288,6 +298,7 @@ def fetch_order_lines_batched(line_ids, batch_size=1000):
                         "order_id",
                         "product_template_id",
                         "product_uom_qty",
+                        "price_unit",
                         "price_subtotal",
                     ]
                     + line_optional_fields,
@@ -501,6 +512,152 @@ def _date_qty_strings(date_qty_map):
 
 
 # ---------------- AGGREGATE PACKING/DELIVERY BY OA + ACTION DATE ----------------
+# ---------------- FETCH OPERATION.DETAILS FG BALANCE (per OA) ----------------
+op_fields_for_fg = ["id", "oa_id", "fg_balance", "final_price"]
+
+
+def fetch_operation_details_batched(order_ids, batch_size=500):
+    all_records = []
+    # Use FG-specific domain (matches fg_stock.py): only records with FG balance
+    base_domain = [
+        ("next_operation", "=", "FG Packing"),
+        ("state", "!=", "done"),
+        ("state", "!=", "closed"),
+        ("company_id", "in", [1, 3]),
+        ("fg_balance", ">", 0),
+    ]
+    for i in range(0, len(order_ids), batch_size):
+        batch_order_ids = order_ids[i : i + batch_size]
+        domain = base_domain + [("oa_id", "in", batch_order_ids)]
+        try:
+            batch = models.execute_kw(
+                db,
+                uid,
+                api_key or password,
+                "operation.details",
+                "search_read",
+                [domain],
+                {"fields": op_fields_for_fg},
+            )
+            all_records.extend(batch)
+            print(
+                f"  🔎 operation.details batch {i//batch_size + 1}: {len(batch)} records"
+            )
+        except Exception as e:
+            print(f"  ⚠️ operation.details batch {i//batch_size + 1} failed: {e}")
+    return all_records
+
+
+print("🔄 Fetching operation.details FG balances in batches...")
+op_records = fetch_operation_details_batched(order_ids)
+print(f"✅ {len(op_records)} operation.details records fetched for FG balances")
+
+fg_balance_by_oa = {}
+fg_value_by_oa = {}
+for r in op_records:
+    oid = _extract_m2o_id(r.get("oa_id"))
+    if not oid:
+        continue
+    fb = _to_float(r.get("fg_balance"), 0.0)
+    fp = _to_float(r.get("final_price"), 0.0)
+    fg_balance_by_oa[oid] = fg_balance_by_oa.get(oid, 0.0) + fb
+    fg_value_by_oa[oid] = fg_value_by_oa.get(oid, 0.0) + (fb * fp)
+
+# ---------------- FETCH MANUFACTURING ORDERS (PRODUCTION PENDING) ----------------
+MANUF_MODEL = "manufacturing.order"
+MANUF_FIELDS = [
+    "id",
+    "oa_id",
+    "balance_qty",
+    "fg_categ_type",
+    "oa_total_balance",
+    "sale_order_line",
+    "state",
+]
+
+
+MANUF_DOMAIN = [
+    ("fg_categ_type", "!=", ""),
+    ("balance_qty", ">", 0),
+    ("oa_total_balance", ">", 0),
+    ("oa_id", "!=", False),
+    ("state", "not in", ("closed", "cancel", "hold")),
+    ("company_id", "in", [1, 3]),
+    ("sale_order_line.state", "=", "sale"),
+]
+
+
+def fetch_manuf_orders():
+    try:
+        return models.execute_kw(
+            db,
+            uid,
+            api_key or password,
+            MANUF_MODEL,
+            "search_read",
+            [MANUF_DOMAIN],
+            {"fields": MANUF_FIELDS},
+        )
+    except Exception as e:
+        print(f"⚠️ manufacturing.order fetch failed: {e}")
+        return []
+
+
+print("🔄 Fetching manufacturing orders (production pending)...")
+manuf_records = fetch_manuf_orders()
+print(f"✅ {len(manuf_records)} manufacturing.order records fetched")
+
+prod_pending_qty_by_oa = {}
+prod_pending_value_by_oa = {}
+sale_line_ids = []
+for rec in manuf_records:
+    sol_val = rec.get("sale_order_line")
+    if isinstance(sol_val, list) and sol_val:
+        sale_line_ids.append(sol_val[0])
+
+sale_line_ids = list(set(sale_line_ids))
+sale_line_details = {}
+if sale_line_ids:
+    try:
+        sale_lines = models.execute_kw(
+            db,
+            uid,
+            api_key or password,
+            "sale.order.line",
+            "read",
+            [sale_line_ids],
+            {"fields": ["id", "price_unit", "discount"]},
+        )
+        for line in sale_lines:
+            sale_line_details[line["id"]] = {
+                "price_unit": _to_float(line.get("price_unit"), 0.0),
+                "discount": _to_float(line.get("discount"), 0.0),
+            }
+    except Exception as e:
+        print(
+            f"⚠️ Failed to fetch sale.order.line details for manufacturing orders: {e}"
+        )
+
+for rec in manuf_records:
+    oid = _extract_m2o_id(rec.get("oa_id"))
+    if not oid:
+        continue
+    balance_qty_val = _to_float(rec.get("balance_qty"), 0.0)
+    sol_val = rec.get("sale_order_line")
+    sol_id = sol_val[0] if isinstance(sol_val, list) and sol_val else None
+    sol_data = sale_line_details.get(sol_id, {})
+    price_unit_val = _to_float(sol_data.get("price_unit"), 0.0)
+    discount_val = _to_float(sol_data.get("discount"), 0.0)
+
+    gross_pending_value = balance_qty_val * price_unit_val
+    pending_value_val = gross_pending_value * (1 - (discount_val / 100))
+
+    prod_pending_qty_by_oa[oid] = prod_pending_qty_by_oa.get(oid, 0.0) + balance_qty_val
+    prod_pending_value_by_oa[oid] = (
+        prod_pending_value_by_oa.get(oid, 0.0) + pending_value_val
+    )
+
+
 packing_by_oa = {}
 for pack in packing_records:
     order_id = _extract_m2o_id(pack.get("oa_id"))
@@ -581,16 +738,40 @@ for order in orders:
         value = line.get("price_subtotal") or 0
 
         if item_name not in item_agg:
-            item_agg[item_name] = {"qty": 0, "value": 0}
-        item_agg[item_name]["qty"] += qty
-        item_agg[item_name]["value"] += value
+            item_agg[item_name] = {
+                "qty": 0.0,
+                "value": 0.0,
+                "unit_price_weighted_sum": 0.0,
+                "unit_price_qty_sum": 0.0,
+            }
+
+        qty_float = _to_float(qty, 0.0)
+        item_agg[item_name]["qty"] += qty_float
+        item_agg[item_name]["value"] += _to_float(value, 0.0)
+
+        price_unit = line.get("price_unit")
+        if qty_float:
+            item_agg[item_name]["unit_price_weighted_sum"] += (
+                _to_float(price_unit, 0.0) * qty_float
+            )
+            item_agg[item_name]["unit_price_qty_sum"] += qty_float
 
     item_names = list(item_agg.keys())
     oa_qty_list = [item_agg[name]["qty"] for name in item_names]
     oa_value_list = [item_agg[name]["value"] for name in item_names]
 
+    unit_price_list = []
+    for name in item_names:
+        qty_sum = item_agg[name].get("unit_price_qty_sum") or 0.0
+        weighted = item_agg[name].get("unit_price_weighted_sum") or 0.0
+        if qty_sum:
+            unit_price_list.append(weighted / qty_sum)
+        else:
+            unit_price_list.append("")
+
     item_str = ",".join(item_names)
     oa_qty_str = ",".join(_format_number(x) for x in oa_qty_list)
+    unit_price_str = ",".join(_format_3dp(x) for x in unit_price_list)
     oa_value_str = ",".join(_format_number(x) for x in oa_value_list)
 
     total_oa_qty = sum(oa_qty_list) if oa_qty_list else 0
@@ -666,7 +847,16 @@ for order in orders:
             "marketing_team": marketing_team,
             "item": item_str,
             "oa_qty": oa_qty_str,
+            "unit_price": unit_price_str,
             "oa_value": oa_value_str,
+            "fg_balance": _format_number(fg_balance_by_oa.get(order_id, 0.0)),
+            "fg_value": _format_number(fg_value_by_oa.get(order_id, 0.0)),
+            "prod_pending_qty": _format_number(
+                prod_pending_qty_by_oa.get(order_id, 0.0)
+            ),
+            "prod_pending_value": _format_number(
+                prod_pending_value_by_oa.get(order_id, 0.0)
+            ),
             "packed_qty": packed_qtys,
             "packed_date": packed_dates,
             "delivery_qty": delivery_qtys,
@@ -694,6 +884,11 @@ column_order = [
     "marketing_team",
     "item",
     "oa_qty",
+    "unit_price",
+    "fg_balance",
+    "fg_value",
+    "prod_pending_qty",
+    "prod_pending_value",
     "oa_value",
     "packed_qty",
     "packed_date",
