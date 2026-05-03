@@ -817,19 +817,26 @@ for order in orders:
     total_delivered = _to_float(total_delivery_qty, 0.0)
 
     status = ""
-    if total_oa_qty > 0:
-        if total_oa_qty_deliverable == 0:
-            status = "Delivered"
-        elif total_prod_pending <= 0 and total_fg_balance <= 0:
-            status = "Delivered"
-        elif total_prod_pending <= 0 and total_fg_balance > 0:
-            status = "FG Stock"
-        elif total_delivered > 0:
-            status = "Partially Delivered"
-        elif total_fg_balance > 0:
-            status = "Partially Production Completed"
-        else:
-            status = "Pending Production"
+
+    # 1. Fully Delivered
+    if total_oa_qty_deliverable > 0 and total_delivered >= total_oa_qty_deliverable:
+        status = "Delivered"
+
+    # 2. Partially Delivered
+    elif total_delivered > 0:
+        status = "Partially Delivered"
+
+    # 3. In Production (must come BEFORE FG)
+    elif total_prod_pending > 0 and total_prod_pending < total_oa_qty_deliverable:
+        status = "In Production"
+
+    # 4. FG Stock (only when production fully done)
+    elif total_prod_pending <= 0 and total_fg_balance > 0:
+        status = "FG Stock"
+
+    # 5. Pending Production
+    else:
+        status = "Pending Production"
 
     all_data.append(
         {
