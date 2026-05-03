@@ -812,25 +812,23 @@ for order in orders:
         delivery_value_by_oa.get(order_id, {})
     )
 
+    total_prod_pending = _to_float(prod_pending_qty_by_oa.get(order_id, 0.0), 0.0)
+    total_fg_balance = _to_float(fg_balance_by_oa.get(order_id, 0.0), 0.0)
+    total_delivered = _to_float(total_delivery_qty, 0.0)
+
     status = ""
-    if total_oa_qty:
+    if total_oa_qty > 0:
         if total_oa_qty_deliverable == 0:
             status = "Delivered"
-        elif (
-            total_delivery_value + DELIVERED_VALUE_TOLERANCE
-            >= total_oa_value_deliverable
-        ):
+        elif total_prod_pending <= 0 and total_fg_balance <= 0:
             status = "Delivered"
-        elif (
-            total_packed_qty >= total_oa_qty_deliverable
-            and (total_packed_qty - total_delivery_qty) > 0
-        ):
+        elif total_prod_pending <= 0 and total_fg_balance > 0:
             status = "FG Stock"
-        elif total_delivery_qty > 0 and total_delivery_qty < total_oa_qty_deliverable:
-            status = "Partially delivered"
-        elif total_packed_qty > 0 and total_packed_qty < total_oa_qty_deliverable:
-            status = "Partially Production completed"
-        elif total_packed_qty == 0:
+        elif total_delivered > 0:
+            status = "Partially Delivered"
+        elif total_fg_balance > 0:
+            status = "Partially Production Completed"
+        else:
             status = "Pending Production"
 
     all_data.append(
