@@ -27,24 +27,43 @@ if not uid:
 
 models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-def execute_kw_with_retry(model_proxy, db, uid, password, model_name, method, args, kwargs=None, retries=5, delay=5):
+
+def execute_kw_with_retry(
+    model_proxy,
+    db,
+    uid,
+    password,
+    model_name,
+    method,
+    args,
+    kwargs=None,
+    retries=5,
+    delay=5,
+):
     """
     Executes an Odoo XML-RPC call with retry logic for ProtocolErrors (e.g., 502 Bad Gateway).
     """
     if kwargs is None:
         kwargs = {}
-    
+
     for attempt in range(retries):
         try:
-            return model_proxy.execute_kw(db, uid, password, model_name, method, args, kwargs)
+            return model_proxy.execute_kw(
+                db, uid, password, model_name, method, args, kwargs
+            )
         except xmlrpc.client.ProtocolError as e:
-            print(f"⚠️ XML-RPC ProtocolError: {e}. Retrying in {delay} seconds... (Attempt {attempt + 1}/{retries})")
+            print(
+                f"⚠️ XML-RPC ProtocolError: {e}. Retrying in {delay} seconds... (Attempt {attempt + 1}/{retries})"
+            )
             time.sleep(delay)
         except Exception as e:
             # Re-raise other exceptions immediately
             raise e
-            
-    raise Exception(f"❌ Failed to execute {method} on {model_name} after {retries} retries.")
+
+    raise Exception(
+        f"❌ Failed to execute {method} on {model_name} after {retries} retries."
+    )
+
 
 # ---------------- FILTER AND FIELDS ----------------
 order_domain = [
@@ -52,7 +71,7 @@ order_domain = [
     ("state", "!=", "done"),
     ("state", "!=", "closed"),
     ("company_id", "in", [1, 3]),
-    ("fg_balance", ">", 0)
+    ("fg_balance", ">", 0),
     # ("work_center", "=", 7)
 ]
 
@@ -150,8 +169,10 @@ if partner_ids:
 invoice_map = {}
 try:
     # 1. Get all invoice_line_ids
-    inv_line_ids = list({rec["invoice_line_id"][0] for rec in records if rec.get("invoice_line_id")})
-    
+    inv_line_ids = list(
+        {rec["invoice_line_id"][0] for rec in records if rec.get("invoice_line_id")}
+    )
+
     if inv_line_ids:
         print(f"🔍 Fetching {len(inv_line_ids)} invoice lines...")
         # 2. Fetch combine.invoice.line to get invoice_id
@@ -164,23 +185,23 @@ try:
             "combine.invoice.line",
             "read",
             [inv_line_ids],
-            {"fields": ["invoice_id"]}
+            {"fields": ["invoice_id"]},
         )
-        
+
         # 3. Collect invoice_ids
         # invoice_id is usually a tuple [id, name] or just id depending on read
         # In Odoo read result, many2one is (id, name)
-        
+
         # We can map combine_line_id -> invoice_name directly if invoice_id has the name
         # But invoice_id name on combine line might be just "INV/2023/0001" which is perfect.
-        # Let's check if we need to fetch account.move. 
+        # Let's check if we need to fetch account.move.
         # Usually many2one tuple [id, display_name]. display_name of account.move IS the invoice number.
-        
+
         for cl in combine_lines:
             if cl.get("invoice_id"):
                 # cl["invoice_id"] is [id, name]
                 invoice_map[cl["id"]] = cl["invoice_id"][1]
-                
+
     print(f"✅ Mapped {len(invoice_map)} invoices")
 
 except Exception as e:
@@ -224,7 +245,8 @@ for rec in records:
             "buyer Group": safe_field(rec.get("buyer_group")),
             "pack_value": (rec.get("final_price") or 0.0) * (rec.get("qty") or 0.0),
             "fg_balance": rec.get("fg_balance") or "",
-            "fg_stock_value": (rec.get("fg_balance") or 0.0) * (rec.get("final_price") or 0.0),
+            "fg_stock_value": (rec.get("fg_balance") or 0.0)
+            * (rec.get("final_price") or 0.0),
             # "oa_date": format_date(rec.get("date_order")),
         }
     )
@@ -270,17 +292,20 @@ try:
     from google.oauth2.service_account import Credentials
 
     print("\n🚀 Starting Google Sheets Sync...")
-    
+
     # Configuration
-    GSHEETS_CREDS = 'Credentials.json'
-    SPREADSHEET_ID = '1loDazyGlqRnjv9SxYxd7yOTzF9eatCkjI0bsBHPTdpw'
-    SHEET_NAME = 'raw'
-    
+    GSHEETS_CREDS = "Credentials.json"
+    SPREADSHEET_ID = "1loDazyGlqRnjv9SxYxd7yOTzF9eatCkjI0bsBHPTdpw"
+    SHEET_NAME = "raw"
+
     # Authenticate
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = Credentials.from_service_account_file(GSHEETS_CREDS, scopes=scope)
     client = gspread.authorize(creds)
-    
+
     # Open Sheet
     sheet = client.open_by_key(SPREADSHEET_ID)
     try:
@@ -291,8 +316,8 @@ try:
 
     # Prepare Data
     # Replace NaN with empty string for JSON compliance
-    df_clean = df.fillna('')
-    
+    df_clean = df.fillna("")
+
     # Convert datetime objects to string for JSON compliance
     for col in date_columns:
         if col in df_clean.columns:
@@ -302,10 +327,10 @@ try:
     headers = [df_clean.columns.values.tolist()]
     values = df_clean.values.tolist()
     all_data_to_write = headers + values
-    
+
     num_rows = len(all_data_to_write)
     num_cols = len(headers[0])
-    
+
     # Calculate range, e.g., 'A1:W500'
     # Function to convert col index to letter (0 -> A, 22 -> W)
     def col_to_letter(n):
@@ -317,25 +342,25 @@ try:
 
     last_col_letter = col_to_letter(num_cols - 1)
     target_range = f"A1:{last_col_letter}{num_rows}"
-    
+
     print(f"Updating range {target_range} (preserving other columns)...")
-    
+
     # Clear only the specific range we are updating
     # It's safer to clear the data content area first to remove old rows if the new data is shorter
     # But usually we just overwrite. To be safe against "leftover" rows if new data is shorter:
     # 1. Clear A1:W<MaxRows>
-    # or just simple update if we assume data grows. 
+    # or just simple update if we assume data grows.
     # Let's clear the specific columns A to W entirely to be safe?
     # No, clearing 'A:W' might be better.
-    
+
     # Better approach:
     # 1. Clear just the columns we use.
     sheet_range = f"A1:{last_col_letter}{worksheet.row_count}"
     worksheet.batch_clear([sheet_range])
-    
+
     # 2. Update with new data
     worksheet.update(values=all_data_to_write, range_name=f"A1")
-    
+
     print("✅ Google Sheets update complete!")
 
 except ImportError:
