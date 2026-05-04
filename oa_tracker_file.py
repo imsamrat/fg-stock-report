@@ -1,6 +1,7 @@
 import os
 import io
 import xmlrpc.client
+import time
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -49,6 +50,40 @@ uid = common.authenticate(db, username, api_key or password, {})
 models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
 
 
+def execute_kw_with_retry(
+    model_proxy,
+    db,
+    uid,
+    password,
+    model_name,
+    method,
+    args,
+    kwargs=None,
+    retries=5,
+    delay=2,
+):
+    """Execute an Odoo XML-RPC call with retry for transient gateway errors."""
+    if kwargs is None:
+        kwargs = {}
+
+    for attempt in range(1, retries + 1):
+        try:
+            return model_proxy.execute_kw(
+                db, uid, password, model_name, method, args, kwargs
+            )
+        except xmlrpc.client.ProtocolError as e:
+            errcode = getattr(e, "errcode", None)
+            is_gateway_error = errcode in (502, 503, 504)
+            if is_gateway_error and attempt < retries:
+                wait_s = delay * (2 ** (attempt - 1))
+                print(
+                    f"⚠️ XML-RPC ProtocolError {errcode}: {e}. Retrying in {wait_s}s... ({attempt}/{retries})"
+                )
+                time.sleep(wait_s)
+                continue
+            raise
+
+
 def get_existing_fields(model_name, candidate_fields):
     """Return subset of candidate_fields that exist on the given model."""
     try:
@@ -91,6 +126,7 @@ order_domain = [
     ("sales_type", "=", "oa"),
     ("state", "=", "sale"),
     ("is_hold", "=", False),
+    ("pi_type", "=", "regular"),
     ("date_order", ">=", FROM_DATE),
     ("date_order", "<=", TO_DATE),
     ("company_id", "in", [1, 3]),
@@ -511,6 +547,86 @@ def _date_qty_strings(date_qty_map):
     )
 
 
+def fetch_invoiced_qty_by_oa(order_ids, batch_size=100):
+    """Return {sale_order_id: invoiced_qty_sum} using combine.invoice.line.
+
+    Returns:
+        dict on success (may be empty if no invoices), or None if the call fails and
+        the caller should fall back.
+    """
+    if not order_ids:
+        return {}
+
+    required_fields = get_existing_fields(
+        "combine.invoice.line", ["sale_order", "quantity"]
+    )
+    if "sale_order" not in required_fields or "quantity" not in required_fields:
+        print(
+            "ℹ️ combine.invoice.line is missing sale_order/quantity; lc_status will use qty_invoiced fallback."
+        )
+        return None
+
+    has_invoice_date = "invoice_date" in get_existing_fields(
+        "combine.invoice.line", ["invoice_date"]
+    )
+    has_parent_state = "parent_state" in get_existing_fields(
+        "combine.invoice.line", ["parent_state"]
+    )
+
+    base_domain = []
+    if has_invoice_date:
+        base_domain.extend(
+            [("invoice_date", ">=", FROM_DATE), ("invoice_date", "<=", TO_DATE)]
+        )
+
+    # Align with sale.order.line.qty_invoiced behavior (posted invoices only).
+    if has_parent_state:
+        base_domain.append(("parent_state", "=", "posted"))
+
+    qty_by_oa = {}
+    total_batches = (len(order_ids) + batch_size - 1) // batch_size
+
+    for i in range(0, len(order_ids), batch_size):
+        batch_order_ids = order_ids[i : i + batch_size]
+        domain = base_domain + [("sale_order", "in", batch_order_ids)]
+
+        try:
+            grouped = execute_kw_with_retry(
+                models,
+                db,
+                uid,
+                api_key or password,
+                "combine.invoice.line",
+                "read_group",
+                [domain],
+                {
+                    "fields": ["sale_order", "quantity:sum"],
+                    "groupby": ["sale_order"],
+                    "lazy": False,
+                },
+            )
+            print(
+                f"  🧾 Invoice qty batch {i//batch_size + 1}/{total_batches}: {len(grouped or [])} groups"
+            )
+        except Exception as e:
+            print(
+                f"⚠️ Warning: Could not aggregate combine.invoice.line quantities (batch {i//batch_size + 1}/{total_batches}): {e}"
+            )
+            return None
+
+        for row in grouped or []:
+            oid = _extract_m2o_id(row.get("sale_order"))
+            if not oid:
+                continue
+            qty_val = row.get("quantity")
+            if qty_val is None:
+                qty_val = row.get("quantity_sum")
+            qty_by_oa[oid] = qty_by_oa.get(oid, 0.0) + _to_float(qty_val, 0.0)
+
+    print(f"✅ Invoiced qty aggregated for {len(qty_by_oa)} OAs")
+    return qty_by_oa
+
+
 # ---------------- AGGREGATE PACKING/DELIVERY BY OA + ACTION DATE ----------------
 # ---------------- FETCH OPERATION.DETAILS FG BALANCE (per OA) ----------------
 op_fields_for_fg = ["id", "oa_id", "fg_balance", "final_price"]
@@ -696,6 +812,13 @@ for delivery in delivery_records:
     )
 
 
+# ---------------- INVOICED QTY (FOR lc_status) ----------------
+invoiced_qty_by_oa = fetch_invoiced_qty_by_oa(order_ids)
+use_invoice_line_qty = invoiced_qty_by_oa is not None
+if invoiced_qty_by_oa is None:
+    invoiced_qty_by_oa = {}
+
+
 # ---------------- BUILD FINAL OA-LEVEL DATA ----------------
 all_data = []
 
@@ -719,13 +842,18 @@ for order in orders:
     marketing_team = safe_name(order.get("marketing_team"))
 
     item_agg = {}
-    total_invoiced_qty = 0.0
+    total_invoiced_qty = (
+        _to_float(invoiced_qty_by_oa.get(order_id), 0.0)
+        if use_invoice_line_qty
+        else 0.0
+    )
     for line_id in order.get("order_line") or []:
         line = line_map.get(line_id)
         if not line:
             continue
 
-        total_invoiced_qty += _to_float(line.get("qty_invoiced"), 0.0)
+        if not use_invoice_line_qty:
+            total_invoiced_qty += _to_float(line.get("qty_invoiced"), 0.0)
 
         pt_id = _extract_m2o_id(line.get("product_template_id"))
         item_name = product_fg_map.get(pt_id, "") if pt_id else ""
