@@ -1,14 +1,17 @@
 import os
 import io
+import json
+import re
 import xmlrpc.client
 import time
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from openpyxl.utils import get_column_letter
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+
+# from google.oauth2 import service_account
+# from googleapiclient.discovery import build
+# from googleapiclient.http import MediaIoBaseUpload
 
 # ---------------- LOAD ENV ----------------
 load_dotenv()
@@ -119,6 +122,72 @@ def get_field_relation(model_name, field_name):
     except Exception:
         return None
     return None
+
+
+def discover_product_template_size_fields():
+    """Discover product.template size fields for Inch/CM/MM.
+
+    Tries known technical names first, then falls back to scanning fields_get labels.
+    Returns a dict with keys: 'cm', 'inch', 'mm' mapping to field names or None.
+    """
+    field_map = {"cm": None, "inch": None, "mm": None}
+
+    known = {"cm": "size_cm", "inch": "size_inch", "mm": "size_mm"}
+    existing = set(get_existing_fields("product.template", list(known.values())))
+    for key, fname in known.items():
+        if fname in existing:
+            field_map[key] = fname
+
+    if all(field_map.values()):
+        return field_map
+
+    try:
+        all_fields = models.execute_kw(
+            db,
+            uid,
+            api_key or password,
+            "product.template",
+            "fields_get",
+            [],
+            {"attributes": ["string", "type"]},
+        )
+    except Exception:
+        return field_map
+
+    def _token_match(label: str, token: str) -> bool:
+        return re.search(rf"\b{re.escape(token)}\b", label) is not None
+
+    candidates = {"cm": [], "inch": [], "mm": []}
+    for fname, meta in (all_fields or {}).items():
+        label = str((meta or {}).get("string") or "").upper()
+        fname_u = str(fname).upper()
+        if "SIZE" not in label and "SIZE" not in fname_u:
+            continue
+        if "INCH" in fname_u or "INCH" in label or "IN" in fname_u and "INCH" in label:
+            candidates["inch"].append(fname)
+        if _token_match(label, "CM") or "_CM" in fname_u or fname_u.endswith("CM"):
+            candidates["cm"].append(fname)
+        if _token_match(label, "MM") or "_MM" in fname_u or fname_u.endswith("MM"):
+            candidates["mm"].append(fname)
+
+    def _pick(unit_key: str):
+        if field_map[unit_key]:
+            return
+        unit_candidates = candidates.get(unit_key) or []
+        if not unit_candidates:
+            return
+        unit_upper = unit_key.upper()
+        preferred = [
+            f
+            for f in unit_candidates
+            if "SIZE" in f.upper() and unit_upper in f.upper()
+        ]
+        field_map[unit_key] = (preferred or unit_candidates)[0]
+
+    _pick("inch")
+    _pick("cm")
+    _pick("mm")
+    return field_map
 
 
 # ---------------- FETCH SALE ORDERS ----------------
@@ -244,6 +313,73 @@ def _is_non_deliverable_item(item_name: str) -> bool:
     return any(keyword in upper for keyword in NON_DELIVERABLE_ITEM_KEYWORDS)
 
 
+def _normalize_size_value(value):
+    if value is None or value == "":
+        return None
+    try:
+        val = float(value)
+    except Exception:
+        return None
+    val = round(val, 3)
+    if float(val).is_integer():
+        return int(val)
+    return val
+
+
+def _extract_sizes_from_text(text: str, company_name: str):
+    """Extract size numbers from a text, normalized per-company.
+
+    Rules:
+    - Company "Zipper": sizes may be in CM or Inch; normalize all to CM.
+    - Company "Metal Trims": sizes are in MM; keep in MM.
+    """
+    if not text or not company_name:
+        return []
+
+    company_upper = str(company_name).strip().upper()
+    text_upper = str(text).strip().upper()
+    if not text_upper:
+        return []
+
+    sizes = []
+
+    if company_upper == "ZIPPER":
+        # Match explicit units like "15 CM", "6 INCH", "6 IN".
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(CM|INCHES?|IN)\b", text_upper):
+            raw_val = m.group(1)
+            unit = m.group(2)
+            try:
+                num = float(raw_val)
+            except Exception:
+                continue
+            if unit.startswith("IN"):
+                num = num * 2.54
+            sizes.append(_normalize_size_value(num))
+
+        # Match inch symbol like 6" or 6″.
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:\"|″|”)", text_upper):
+            raw_val = m.group(1)
+            try:
+                num = float(raw_val) * 2.54
+            except Exception:
+                continue
+            sizes.append(_normalize_size_value(num))
+
+    elif company_upper == "METAL TRIMS":
+        for m in re.finditer(r"(\d+(?:\.\d+)?)\s*MM\b", text_upper):
+            raw_val = m.group(1)
+            try:
+                num = float(raw_val)
+            except Exception:
+                continue
+            sizes.append(_normalize_size_value(num))
+
+    # Filter Nones, dedupe, sort
+    sizes = [s for s in sizes if s is not None]
+    sizes = sorted(set(sizes), key=lambda x: float(x))
+    return sizes
+
+
 def _parse_local_date(date_value):
     """Parse Odoo datetime/date string and return local date.
 
@@ -276,6 +412,15 @@ def _parse_local_date(date_value):
 
 
 def upload_excel_bytes_to_drive(excel_bytes, filename, folder_id):
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+    except ImportError as e:
+        raise RuntimeError(
+            "Google Drive upload dependencies are not installed. Install 'google-api-python-client' and 'google-auth' to enable upload."
+        ) from e
+
     creds = service_account.Credentials.from_service_account_file(
         GOOGLE_SERVICE_ACCOUNT_FILE,
         scopes=DRIVE_SCOPES,
@@ -309,7 +454,9 @@ all_line_ids = [
     line_id for order in orders for line_id in (order.get("order_line") or [])
 ]
 
-line_optional_fields = get_existing_fields("sale.order.line", ["qty_invoiced"])
+line_optional_fields = get_existing_fields(
+    "sale.order.line", ["qty_invoiced", "sizein", "sizecm", "sizemm"]
+)
 
 
 def fetch_order_lines_batched(line_ids, batch_size=1000):
@@ -369,7 +516,12 @@ for line in lines:
         product_template_ids.add(pt_val)
 
 product_template_fg_field = get_existing_fields("product.template", ["fg_categ_type"])
+product_template_size_field_map = discover_product_template_size_fields()
+product_template_size_fields = [
+    f for f in product_template_size_field_map.values() if f
+]
 product_fg_map = {}
+product_size_map = {}
 
 
 def fetch_product_templates_batched(template_ids, fields, batch_size=1000):
@@ -400,21 +552,51 @@ def fetch_product_templates_batched(template_ids, fields, batch_size=1000):
     return all_templates
 
 
-if product_template_ids and product_template_fg_field:
-    print("🔄 Fetching fg_categ_type from product.template...")
+template_fields_to_fetch = sorted(
+    set((product_template_fg_field or []) + (product_template_size_fields or []))
+)
+
+if product_template_ids and template_fields_to_fetch:
+    print("🔄 Fetching product.template fields...")
     templates = fetch_product_templates_batched(
-        product_template_ids, product_template_fg_field
+        product_template_ids, template_fields_to_fetch
     )
     for template in templates:
         template_id = template.get("id")
         if not template_id:
             continue
-        product_fg_map[template_id] = safe_name(template.get("fg_categ_type"))
-    print(f"✅ fg_categ_type fetched for {len(product_fg_map)} templates")
+
+        if "fg_categ_type" in template_fields_to_fetch:
+            product_fg_map[template_id] = safe_name(template.get("fg_categ_type"))
+
+        if product_template_size_fields:
+            product_size_map[template_id] = {
+                "cm": (
+                    template.get(product_template_size_field_map.get("cm"))
+                    if product_template_size_field_map.get("cm")
+                    else None
+                ),
+                "inch": (
+                    template.get(product_template_size_field_map.get("inch"))
+                    if product_template_size_field_map.get("inch")
+                    else None
+                ),
+                "mm": (
+                    template.get(product_template_size_field_map.get("mm"))
+                    if product_template_size_field_map.get("mm")
+                    else None
+                ),
+            }
+
+    if "fg_categ_type" in template_fields_to_fetch:
+        print(f"✅ fg_categ_type fetched for {len(product_fg_map)} templates")
+    if product_template_size_fields:
+        print(f"✅ Size fields fetched for {len(product_size_map)} templates")
 else:
-    print(
-        "ℹ️ fg_categ_type not found on product.template (item will fall back to product name)"
-    )
+    if not template_fields_to_fetch:
+        print("ℹ️ No fg_categ_type/size fields found on product.template")
+    else:
+        print("ℹ️ No product templates found to read sizes")
 
 
 # ---------------- FETCH PACKING RECORDS ----------------
@@ -547,6 +729,20 @@ def _date_qty_strings(date_qty_map):
     )
 
 
+def _date_qty_strings_with_sep(date_qty_map, inner_sep=","):
+    if not date_qty_map:
+        return "", "", 0
+
+    dates_sorted = sorted(date_qty_map.keys())
+    qty_list = [date_qty_map[d] for d in dates_sorted]
+    total_qty = sum(qty_list) if qty_list else 0
+    return (
+        inner_sep.join(d.strftime("%d-%m-%Y") for d in dates_sorted),
+        inner_sep.join(_format_number(q) for q in qty_list),
+        total_qty,
+    )
+
+
 def fetch_invoiced_qty_by_oa(order_ids, batch_size=100):
     """Return {sale_order_id: invoiced_qty_sum} using combine.invoice.line.
 
@@ -630,6 +826,7 @@ def fetch_invoiced_qty_by_oa(order_ids, batch_size=100):
 # ---------------- AGGREGATE PACKING/DELIVERY BY OA + ACTION DATE ----------------
 # ---------------- FETCH OPERATION.DETAILS FG BALANCE (per OA) ----------------
 op_fields_for_fg = ["id", "oa_id", "fg_balance", "final_price"]
+op_fields_for_fg += get_existing_fields("operation.details", ["sale_order_line"])
 
 
 def fetch_operation_details_batched(order_ids, batch_size=500):
@@ -723,17 +920,36 @@ print("🔄 Fetching manufacturing orders (production pending)...")
 manuf_records = fetch_manuf_orders()
 print(f"✅ {len(manuf_records)} manufacturing.order records fetched")
 
-prod_pending_qty_by_oa = {}
-prod_pending_value_by_oa = {}
-sale_line_ids = []
-for rec in manuf_records:
-    sol_val = rec.get("sale_order_line")
-    if isinstance(sol_val, list) and sol_val:
-        sale_line_ids.append(sol_val[0])
+# ---------------- ITEM-WISE MAPPING (sale.order.line -> item name) ----------------
+sale_line_ids = set()
 
-sale_line_ids = list(set(sale_line_ids))
-sale_line_details = {}
-if sale_line_ids:
+for rec in packing_records:
+    sol_id = _extract_m2o_id(rec.get("sale_order_line"))
+    if sol_id:
+        sale_line_ids.add(sol_id)
+
+for rec in delivery_records:
+    sol_id = _extract_m2o_id(rec.get("sale_order_line"))
+    if sol_id:
+        sale_line_ids.add(sol_id)
+
+for rec in op_records:
+    sol_id = _extract_m2o_id(rec.get("sale_order_line"))
+    if sol_id:
+        sale_line_ids.add(sol_id)
+
+for rec in manuf_records:
+    sol_id = _extract_m2o_id(rec.get("sale_order_line"))
+    if sol_id:
+        sale_line_ids.add(sol_id)
+
+sale_line_ids = list(sale_line_ids)
+sale_line_fields = get_existing_fields(
+    "sale.order.line", ["product_template_id", "price_unit", "discount"]
+)
+
+sale_line_info = {}
+if sale_line_ids and sale_line_fields:
     try:
         sale_lines = models.execute_kw(
             db,
@@ -742,17 +958,105 @@ if sale_line_ids:
             "sale.order.line",
             "read",
             [sale_line_ids],
-            {"fields": ["id", "price_unit", "discount"]},
+            {"fields": ["id"] + sale_line_fields},
         )
         for line in sale_lines:
-            sale_line_details[line["id"]] = {
+            sol_id = line.get("id")
+            if not sol_id:
+                continue
+            pt_val = line.get("product_template_id")
+            pt_id = _extract_m2o_id(pt_val)
+            pt_name = safe_name(pt_val)
+            item_name = product_fg_map.get(pt_id, "") if pt_id else ""
+            if not item_name:
+                item_name = pt_name
+
+            sale_line_info[sol_id] = {
+                "item_name": item_name,
                 "price_unit": _to_float(line.get("price_unit"), 0.0),
                 "discount": _to_float(line.get("discount"), 0.0),
             }
     except Exception as e:
-        print(
-            f"⚠️ Failed to fetch sale.order.line details for manufacturing orders: {e}"
-        )
+        print(f"⚠️ Failed to fetch sale.order.line details for item-wise mapping: {e}")
+
+
+# ---------------- ITEM-WISE AGGREGATES ----------------
+packing_by_oa_item = {}
+for pack in packing_records:
+    order_id = _extract_m2o_id(pack.get("oa_id"))
+    if not order_id:
+        continue
+    action_date = _parse_local_date(pack.get("action_date"))
+    if not action_date:
+        continue
+    sol_id = _extract_m2o_id(pack.get("sale_order_line"))
+    item_name = sale_line_info.get(sol_id, {}).get("item_name")
+    if not item_name:
+        continue
+    qty = _to_float(pack.get("qty"), 0.0)
+
+    packing_by_oa_item.setdefault(order_id, {}).setdefault(item_name, {})
+    packing_by_oa_item[order_id][item_name][action_date] = (
+        packing_by_oa_item[order_id][item_name].get(action_date, 0.0) + qty
+    )
+
+
+delivery_qty_by_oa_item = {}
+delivery_value_by_oa_item = {}
+for delivery in delivery_records:
+    order_id = _extract_m2o_id(delivery.get("oa_id"))
+    if not order_id:
+        continue
+    action_date = _parse_local_date(delivery.get("action_date"))
+    if not action_date:
+        continue
+    sol_id = _extract_m2o_id(delivery.get("sale_order_line"))
+    item_name = sale_line_info.get(sol_id, {}).get("item_name")
+    if not item_name:
+        continue
+
+    qty = _to_float(delivery.get("qty"), 0.0)
+    final_price = _to_float(delivery.get("final_price"), 0.0)
+    value = qty * final_price
+
+    delivery_qty_by_oa_item.setdefault(order_id, {}).setdefault(item_name, {})
+    delivery_qty_by_oa_item[order_id][item_name][action_date] = (
+        delivery_qty_by_oa_item[order_id][item_name].get(action_date, 0.0) + qty
+    )
+
+    delivery_value_by_oa_item.setdefault(order_id, {}).setdefault(item_name, {})
+    delivery_value_by_oa_item[order_id][item_name][action_date] = (
+        delivery_value_by_oa_item[order_id][item_name].get(action_date, 0.0) + value
+    )
+
+
+fg_balance_by_oa_item = {}
+fg_value_by_oa_item = {}
+for r in op_records:
+    oid = _extract_m2o_id(r.get("oa_id"))
+    if not oid:
+        continue
+    sol_id = _extract_m2o_id(r.get("sale_order_line"))
+    item_name = sale_line_info.get(sol_id, {}).get("item_name")
+    if not item_name:
+        continue
+
+    fb = _to_float(r.get("fg_balance"), 0.0)
+    fp = _to_float(r.get("final_price"), 0.0)
+    fg_balance_by_oa_item.setdefault(oid, {})
+    fg_value_by_oa_item.setdefault(oid, {})
+    fg_balance_by_oa_item[oid][item_name] = (
+        fg_balance_by_oa_item[oid].get(item_name, 0.0) + fb
+    )
+    fg_value_by_oa_item[oid][item_name] = fg_value_by_oa_item[oid].get(
+        item_name, 0.0
+    ) + (fb * fp)
+
+
+prod_pending_qty_by_oa = {}
+prod_pending_value_by_oa = {}
+prod_pending_qty_by_oa_item = {}
+prod_pending_value_by_oa_item = {}
 
 for rec in manuf_records:
     oid = _extract_m2o_id(rec.get("oa_id"))
@@ -761,7 +1065,7 @@ for rec in manuf_records:
     balance_qty_val = _to_float(rec.get("balance_qty"), 0.0)
     sol_val = rec.get("sale_order_line")
     sol_id = sol_val[0] if isinstance(sol_val, list) and sol_val else None
-    sol_data = sale_line_details.get(sol_id, {})
+    sol_data = sale_line_info.get(sol_id, {})
     price_unit_val = _to_float(sol_data.get("price_unit"), 0.0)
     discount_val = _to_float(sol_data.get("discount"), 0.0)
 
@@ -772,6 +1076,17 @@ for rec in manuf_records:
     prod_pending_value_by_oa[oid] = (
         prod_pending_value_by_oa.get(oid, 0.0) + pending_value_val
     )
+
+    item_name = sol_data.get("item_name")
+    if item_name:
+        prod_pending_qty_by_oa_item.setdefault(oid, {})
+        prod_pending_value_by_oa_item.setdefault(oid, {})
+        prod_pending_qty_by_oa_item[oid][item_name] = (
+            prod_pending_qty_by_oa_item[oid].get(item_name, 0.0) + balance_qty_val
+        )
+        prod_pending_value_by_oa_item[oid][item_name] = (
+            prod_pending_value_by_oa_item[oid].get(item_name, 0.0) + pending_value_val
+        )
 
 
 packing_by_oa = {}
@@ -842,6 +1157,7 @@ for order in orders:
     marketing_team = safe_name(order.get("marketing_team"))
 
     item_agg = {}
+    size_by_item = {}
     total_invoiced_qty = (
         _to_float(invoiced_qty_by_oa.get(order_id), 0.0)
         if use_invoice_line_qty
@@ -861,6 +1177,37 @@ for order in orders:
             item_name = safe_name(line.get("product_template_id"))
         if not item_name:
             continue
+
+        # Prefer explicit sale.order.line size fields (matches Odoo UI columns)
+        company_upper = str(company).strip().upper()
+        sizes_from_fields = []
+
+        if "ZIPPER" in company_upper:
+            cm_val = line.get("sizecm")
+            inch_val = line.get("sizein")
+            cm_num = _normalize_size_value(cm_val)
+            if cm_num is not None:
+                sizes_from_fields.append(cm_num)
+            inch_num = _normalize_size_value(inch_val)
+            if inch_num is not None:
+                sizes_from_fields.append(_normalize_size_value(float(inch_num) * 2.54))
+
+        elif "METAL TRIMS" in company_upper:
+            mm_val = line.get("sizemm")
+            mm_num = _normalize_size_value(mm_val)
+            if mm_num is not None:
+                sizes_from_fields.append(mm_num)
+
+        for size_val in sizes_from_fields:
+            if size_val is not None:
+                size_by_item.setdefault(item_name, set()).add(size_val)
+
+        # Fallback: parse from name text when size fields are missing/empty
+        if not sizes_from_fields:
+            product_name = safe_name(line.get("product_template_id"))
+            for source_text in (product_name, item_name):
+                for size_val in _extract_sizes_from_text(source_text, company):
+                    size_by_item.setdefault(item_name, set()).add(size_val)
 
         qty = line.get("product_uom_qty") or 0
         value = line.get("price_subtotal") or 0
@@ -940,6 +1287,164 @@ for order in orders:
         delivery_value_by_oa.get(order_id, {})
     )
 
+    # ---------------- ITEM-WISE STRINGS (comma-aligned with item list) ----------------
+    fg_balance_item_str = ",".join(
+        _format_number(fg_balance_by_oa_item.get(order_id, {}).get(name))
+        for name in item_names
+    )
+    fg_value_item_str = ",".join(
+        _format_number(fg_value_by_oa_item.get(order_id, {}).get(name))
+        for name in item_names
+    )
+    prod_pending_qty_item_str = ",".join(
+        _format_number(prod_pending_qty_by_oa_item.get(order_id, {}).get(name))
+        for name in item_names
+    )
+    prod_pending_value_item_str = ",".join(
+        _format_number(prod_pending_value_by_oa_item.get(order_id, {}).get(name))
+        for name in item_names
+    )
+
+    packed_qty_item_parts = []
+    packed_date_item_parts = []
+    for name in item_names:
+        dates_s, qtys_s, _ = _date_qty_strings_with_sep(
+            packing_by_oa_item.get(order_id, {}).get(name, {}),
+            inner_sep=";",
+        )
+        packed_date_item_parts.append(dates_s)
+        packed_qty_item_parts.append(qtys_s)
+    packed_qty_item_str = ",".join(packed_qty_item_parts)
+    packed_date_item_str = ",".join(packed_date_item_parts)
+
+    delivery_qty_item_parts = []
+    delivery_date_item_parts = []
+    delivery_value_item_parts = []
+    for name in item_names:
+        d_dates_s, d_qtys_s, _ = _date_qty_strings_with_sep(
+            delivery_qty_by_oa_item.get(order_id, {}).get(name, {}),
+            inner_sep=";",
+        )
+        _, d_values_s, _ = _date_qty_strings_with_sep(
+            delivery_value_by_oa_item.get(order_id, {}).get(name, {}),
+            inner_sep=";",
+        )
+        delivery_date_item_parts.append(d_dates_s)
+        delivery_qty_item_parts.append(d_qtys_s)
+        delivery_value_item_parts.append(d_values_s)
+
+    delivery_qty_item_str = ",".join(delivery_qty_item_parts)
+    delivery_value_item_str = ",".join(delivery_value_item_parts)
+    delivery_date_item_str = ",".join(delivery_date_item_parts)
+
+    size_json = json.dumps(
+        {
+            name: sorted(size_by_item.get(name, set()), key=lambda x: float(x))
+            for name in item_names
+            if size_by_item.get(name)
+        },
+        ensure_ascii=False,
+    )
+
+    # ---------------- ITEM-WISE JSON (item -> value) ----------------
+    oa_qty_json = json.dumps(
+        {name: _format_number(item_agg[name].get("qty")) for name in item_names},
+        ensure_ascii=False,
+    )
+    unit_price_json = json.dumps(
+        {
+            name: _format_3dp(unit_price_list[idx])
+            for idx, name in enumerate(item_names)
+        },
+        ensure_ascii=False,
+    )
+    oa_value_json = json.dumps(
+        {name: _format_number(item_agg[name].get("value")) for name in item_names},
+        ensure_ascii=False,
+    )
+
+    fg_balance_json = json.dumps(
+        {
+            name: _format_number(fg_balance_by_oa_item.get(order_id, {}).get(name))
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+    fg_value_json = json.dumps(
+        {
+            name: _format_number(fg_value_by_oa_item.get(order_id, {}).get(name))
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+
+    prod_pending_qty_json = json.dumps(
+        {
+            name: _format_number(
+                prod_pending_qty_by_oa_item.get(order_id, {}).get(name)
+            )
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+    prod_pending_value_json = json.dumps(
+        {
+            name: _format_number(
+                prod_pending_value_by_oa_item.get(order_id, {}).get(name)
+            )
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+
+    packed_qty_json = json.dumps(
+        {
+            name: _date_qty_strings_with_sep(
+                packing_by_oa_item.get(order_id, {}).get(name, {}), inner_sep=";"
+            )[1]
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+    packed_date_json = json.dumps(
+        {
+            name: _date_qty_strings_with_sep(
+                packing_by_oa_item.get(order_id, {}).get(name, {}), inner_sep=";"
+            )[0]
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+
+    delivery_qty_json = json.dumps(
+        {
+            name: _date_qty_strings_with_sep(
+                delivery_qty_by_oa_item.get(order_id, {}).get(name, {}), inner_sep=";"
+            )[1]
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+    delivery_value_json = json.dumps(
+        {
+            name: _date_qty_strings_with_sep(
+                delivery_value_by_oa_item.get(order_id, {}).get(name, {}),
+                inner_sep=";",
+            )[1]
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+    delivery_date_json = json.dumps(
+        {
+            name: _date_qty_strings_with_sep(
+                delivery_qty_by_oa_item.get(order_id, {}).get(name, {}), inner_sep=";"
+            )[0]
+            for name in item_names
+        },
+        ensure_ascii=False,
+    )
+
     total_prod_pending = _to_float(prod_pending_qty_by_oa.get(order_id, 0.0), 0.0)
     total_fg_balance = _to_float(fg_balance_by_oa.get(order_id, 0.0), 0.0)
     total_delivered = _to_float(total_delivery_qty, 0.0)
@@ -979,22 +1484,20 @@ for order in orders:
             "marketing_person": marketing_person,
             "marketing_team": marketing_team,
             "item": item_str,
-            "oa_qty": oa_qty_str,
-            "unit_price": unit_price_str,
-            "oa_value": oa_value_str,
-            "fg_balance": _format_number(fg_balance_by_oa.get(order_id, 0.0)),
-            "fg_value": _format_number(fg_value_by_oa.get(order_id, 0.0)),
-            "prod_pending_qty": _format_number(
-                prod_pending_qty_by_oa.get(order_id, 0.0)
-            ),
-            "prod_pending_value": _format_number(
-                prod_pending_value_by_oa.get(order_id, 0.0)
-            ),
-            "packed_qty": packed_qtys,
-            "packed_date": packed_dates,
-            "delivery_qty": delivery_qtys,
-            "delivery_value": delivery_values,
-            "delivery_date": delivery_dates,
+            "size": size_json,
+            # Item-wise JSON maps (kept under the original column names)
+            "oa_qty": oa_qty_json,
+            "unit_price": unit_price_json,
+            "fg_balance": fg_balance_json,
+            "fg_value": fg_value_json,
+            "prod_pending_qty": prod_pending_qty_json,
+            "prod_pending_value": prod_pending_value_json,
+            "oa_value": oa_value_json,
+            "packed_qty": packed_qty_json,
+            "packed_date": packed_date_json,
+            "delivery_qty": delivery_qty_json,
+            "delivery_value": delivery_value_json,
+            "delivery_date": delivery_date_json,
             "status": status,
             "lc_status": lc_status,
         }
@@ -1016,6 +1519,7 @@ column_order = [
     "marketing_person",
     "marketing_team",
     "item",
+    "size",
     "oa_qty",
     "unit_price",
     "fg_balance",
@@ -1054,32 +1558,33 @@ else:
 
     excel_bytes = excel_buffer.getvalue()
 
-    try:
-        uploaded = upload_excel_bytes_to_drive(
-            excel_bytes=excel_bytes,
-            filename=output_file,
-            folder_id=DRIVE_FOLDER_ID,
-        )
-        link_or_id = uploaded.get("webViewLink") or uploaded.get("id")
-        print(f"☁️ Export complete! Uploaded to Google Drive: {link_or_id}")
-    except Exception as e:
-        print(f"❌ Google Drive upload failed: {e}")
-        print(
-            "ℹ️ Make sure the Drive folder is shared with the service account email, and that google-api-python-client is installed."
-        )
+    # ---------------- GOOGLE DRIVE UPLOAD (DISABLED) ----------------
+    # try:
+    #     uploaded = upload_excel_bytes_to_drive(
+    #         excel_bytes=excel_bytes,
+    #         filename=output_file,
+    #         folder_id=DRIVE_FOLDER_ID,
+    #     )
+    #     link_or_id = uploaded.get("webViewLink") or uploaded.get("id")
+    #     print(f"☁️ Export complete! Uploaded to Google Drive: {link_or_id}")
+    # except Exception as e:
+    #     print(f"❌ Google Drive upload failed: {e}")
+    #     print(
+    #         "ℹ️ Make sure the Drive folder is shared with the service account email, and that google-api-python-client is installed."
+    #     )
 
     # ---------------- LOCAL EXPORT OPTION (DISABLED) ----------------
     # If you want local export instead, uncomment this block.
-    # with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-    #     df.to_excel(writer, index=False, sheet_name="OA_Tracker")
-    #
-    #     worksheet = writer.sheets["OA_Tracker"]
-    #     released_col_idx = df.columns.get_loc("released_date") + 1
-    #     released_col_letter = get_column_letter(released_col_idx)
-    #     for row in range(2, len(df) + 2):
-    #         cell = worksheet[f"{released_col_letter}{row}"]
-    #         if cell.value is not None and cell.value != "":
-    #             cell.number_format = "DD-MM-YYYY"
-    #
-    # print(f"📂 Export complete! File saved as {output_file}")
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="OA_Tracker")
+
+        worksheet = writer.sheets["OA_Tracker"]
+        released_col_idx = df.columns.get_loc("released_date") + 1
+        released_col_letter = get_column_letter(released_col_idx)
+        for row in range(2, len(df) + 2):
+            cell = worksheet[f"{released_col_letter}{row}"]
+            if cell.value is not None and cell.value != "":
+                cell.number_format = "DD-MM-YYYY"
+
+    print(f"📂 Export complete! File saved as {output_file}")
     print(f"ℹ️ Total records: {len(df)}")
