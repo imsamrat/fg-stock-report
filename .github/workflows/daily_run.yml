@@ -2,8 +2,8 @@ name: Daily FG Stock Report
 
 on:
   schedule:
-    # 5:11 AM Dhaka Time = 23:11 UTC (previous day)
-    - cron: "11 23 * * *"
+    # 1:41 AM Dhaka Time = 19:41 UTC 
+    - cron: "41 19 * * *"
   workflow_dispatch: # Allow manual trigger
 
 jobs:
